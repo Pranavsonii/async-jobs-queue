@@ -1,0 +1,124 @@
+# run everything: `docker compose up --build`
+#
+#   postgres        payouts, outbox, idempotency ledger, DLQ
+#   redis           broker + result backend
+#   api             fastapi, only accepts work
+#   worker-payouts  payout tasks, low concurrency
+#   worker-fast     receipts and webhooks
+#   worker-heavy    reports (cpu bound)
+#   beat            scheduler - only one!
+#   flower          dashboard
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payflow
+      POSTGRES_PASSWORD: payflow
+      POSTGRES_DB: payflow
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # depends_on only waits for the container to start, not for postgres
+      # to accept connections. healthcheck fixes that
+      test: ["CMD-SHELL", "pg_isready -U payflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # appendonly so queued jobs survive a redis restart
+    command: redis-server --appendonly yes
+    ports: ["6379:6379"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment: &env
+      REDIS_BROKER_URL: redis://redis:6379/0
+      REDIS_BACKEND_URL: redis://redis:6379/1
+      DATABASE_URL: postgresql+psycopg://payflow:payflow@postgres:5432/payflow
+      GATEWAY_FAILURE_RATE: "0.25"
+      PYTHONUNBUFFERED: "1"
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_healthy}
+
+  # payouts - kept at low concurrency so we don't hammer the gateway
+  worker-payouts:
+    build: .
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --queues=payouts,default
+      --pool=prefork
+      --concurrency=4
+      --hostname=payouts@%h
+    environment: *env
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_healthy}
+    # to scale: docker compose up -d --scale worker-payouts=3
+
+  # fast lane, separate so slow reports never delay receipts
+  worker-fast:
+    build: .
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --queues=fast
+      --pool=prefork
+      --concurrency=8
+      --hostname=fast@%h
+    environment: *env
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_healthy}
+
+  # reports, cpu heavy so prefork with concurrency around number of cores
+  worker-heavy:
+    build: .
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --queues=heavy
+      --pool=prefork
+      --concurrency=2
+      --hostname=heavy@%h
+    environment: *env
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_healthy}
+
+  # don't scale this. two beats = every scheduled job runs twice
+  beat:
+    build: .
+    command: celery -A app.celery_app beat --loglevel=info
+    environment: *env
+    deploy:
+      replicas: 1
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_healthy}
+
+  flower:
+    build: .
+    command: celery -A app.celery_app flower --port=5555
+    environment: *env
+    ports: ["5555:5555"]
+    depends_on:
+      redis: {condition: service_healthy}
+
+volumes:
+  pgdata:
+  redisdata:
