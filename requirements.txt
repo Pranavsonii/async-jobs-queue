@@ -1,0 +1,15 @@
+# core
+celery[redis]==5.4.0        # worker + beat + producer api
+redis==5.2.1                # broker and result backend
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# db
+SQLAlchemy==2.0.36
+psycopg[binary]==3.2.3      # binary build, no compiler needed
+
+# config
+pydantic-settings==2.7.0
+
+# monitoring
+flower==2.0.1               # celery dashboard on :5555
