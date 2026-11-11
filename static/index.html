@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PayFlow Jobs</title>
+<style>
+  :root{
+    --bg:#f4efe6; --surface:#faf7f2; --surface2:#eee8de; --border:#ddd6c8;
+    --ink:#2c2820; --ink2:#4a4438; --muted:#7a7265; --faint:#a8a090;
+    --sage:#3d6b4f; --amber:#96591f; --teal:#256070; --rose:#7a3030;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#1c1a17; --surface:#24221e; --surface2:#2d2a25; --border:#3a362f;
+      --ink:#ece7dc; --ink2:#c9c2b4; --muted:#968d7d; --faint:#6e665a;
+      --sage:#7fb894; --amber:#d9a45f; --teal:#6fb3c4; --rose:#d08a8a;
+    }
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;padding:2rem 1rem 4rem}
+  .wrap{max-width:1040px;margin:0 auto}
+  h1{font-size:1.5rem;letter-spacing:-.01em}
+  .sub{color:var(--muted);font-size:.85rem;margin-top:.15rem}
+  .grid{display:grid;gap:.75rem;margin:1.5rem 0;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.9rem 1rem}
+  .card .label{font-size:.62rem;letter-spacing:.11em;text-transform:uppercase;color:var(--faint)}
+  .card .value{font-size:1.7rem;font-weight:600;line-height:1.2;margin-top:.2rem;font-variant-numeric:tabular-nums}
+  .card.alert .value{color:var(--rose)}
+  .card.busy  .value{color:var(--amber)}
+  h2{font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:2rem 0 .6rem;font-weight:600}
+  table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;font-size:.83rem}
+  th{background:var(--surface2);text-align:left;padding:.5rem .75rem;font-size:.62rem;letter-spacing:.07em;text-transform:uppercase;color:var(--ink2);font-weight:600}
+  td{padding:.5rem .75rem;border-top:1px solid var(--border);color:var(--ink2);font-variant-numeric:tabular-nums}
+  .pill{display:inline-block;padding:.1rem .5rem;border-radius:99px;font-size:.68rem;font-weight:600;letter-spacing:.02em}
+  .pending{background:color-mix(in srgb,var(--faint) 20%,transparent);color:var(--muted)}
+  .processing{background:color-mix(in srgb,var(--amber) 20%,transparent);color:var(--amber)}
+  .paid{background:color-mix(in srgb,var(--sage) 20%,transparent);color:var(--sage)}
+  .failed{background:color-mix(in srgb,var(--rose) 22%,transparent);color:var(--rose)}
+  form{display:flex;gap:.5rem;flex-wrap:wrap;margin:.6rem 0 0}
+  input,button{font:inherit;font-size:.85rem;padding:.45rem .7rem;border-radius:7px;border:1px solid var(--border);background:var(--surface);color:var(--ink)}
+  button{background:var(--sage);color:#fff;border-color:transparent;cursor:pointer;font-weight:600}
+  button.ghost{background:var(--surface2);color:var(--ink2)}
+  .hint{font-size:.76rem;color:var(--muted);margin-top:.5rem}
+  code{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:.9em;background:var(--surface2);padding:.05em .35em;border-radius:4px}
+  .row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;flex-wrap:wrap}
+  a{color:var(--teal)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row">
+    <div>
+      <h1>PayFlow Jobs</h1>
+      <div class="sub">FastAPI producer → Redis broker → Celery workers · <a href="/docs">API docs</a> · <a href="http://localhost:5555" target="_blank" rel="noopener">Flower</a></div>
+    </div>
+    <div class="sub" id="tick">refreshing…</div>
+  </div>
+
+  <h2>Queue depth — the metric that matters</h2>
+  <div class="grid" id="queues"></div>
+
+  <h2>System state</h2>
+  <div class="grid" id="state"></div>
+
+  <h2>Create a payout</h2>
+  <form id="f">
+    <input id="ref" placeholder="reference" required>
+    <input id="ben" placeholder="beneficiary" value="Asha Kumar" required>
+    <input id="amt" type="number" placeholder="amount (paise)" value="250000" required>
+    <button type="submit">Enqueue</button>
+    <button type="button" class="ghost" id="burst">Enqueue 25</button>
+    <button type="button" class="ghost" id="poison">Enqueue a poison job</button>
+  </form>
+  <p class="hint">
+    A reference beginning <code>FAIL-</code> always fails permanently (watch the DLQ counter),
+    <code>FLAKY-</code> always fails transiently (watch <code>attempts</code> climb as backoff retries).
+    Everything else fails randomly at the configured gateway failure rate.
+  </p>
+
+  <h2>Recent payouts</h2>
+  <table>
+    <thead><tr><th>ID</th><th>Reference</th><th>Beneficiary</th><th>Amount</th><th>Status</th><th>Attempts</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const inr = p => "₹" + (p/100).toLocaleString("en-IN", {minimumFractionDigits:2});
+
+function card(label, value, cls=""){
+  return `<div class="card ${cls}"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+}
+
+async function refresh(){
+  try {
+    const [stats, payouts] = await Promise.all([
+      fetch("/stats").then(r=>r.json()),
+      fetch("/payouts?limit=20").then(r=>r.json()),
+    ]);
+
+    $("queues").innerHTML = stats.queues
+      .map(q => card(q.queue, q.depth < 0 ? "?" : q.depth, q.depth > 0 ? "busy" : ""))
+      .join("");
+
+    const s = stats.payouts_by_status;
+    $("state").innerHTML = [
+      card("paid", s.paid || 0),
+      card("processing", s.processing || 0, (s.processing||0) ? "busy" : ""),
+      card("pending", s.pending || 0),
+      card("failed", s.failed || 0, (s.failed||0) ? "alert" : ""),
+      card("outbox pending", stats.outbox_pending, stats.outbox_pending > 20 ? "busy" : ""),
+      card("dead letters", stats.dead_letters, stats.dead_letters ? "alert" : ""),
+      card("idempotency keys", stats.idempotency_keys),
+    ].join("");
+
+    $("rows").innerHTML = payouts.map(p => `
+      <tr>
+        <td>${p.id}</td>
+        <td><code>${p.reference}</code></td>
+        <td>${p.beneficiary}</td>
+        <td>${inr(p.amount_paise)}</td>
+        <td><span class="pill ${p.status}">${p.status}</span></td>
+        <td>${p.attempts}</td>
+      </tr>`).join("");
+
+    $("tick").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("tick").textContent = "API unreachable";
+  }
+}
+
+async function enqueue(reference, beneficiary, amount_paise){
+  await fetch("/payouts", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({reference, beneficiary, amount_paise}),
+  });
+}
+
+const rid = (p="PO") => `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;
+
+$("f").addEventListener("submit", async e => {
+  e.preventDefault();
+  await enqueue($("ref").value || rid(), $("ben").value, +$("amt").value);
+  $("ref").value = "";
+  refresh();
+});
+
+$("burst").addEventListener("click", async () => {
+  // send 25 together so you can see the queue depth go up and come back down
+  await Promise.all(Array.from({length:25}, () =>
+    enqueue(rid(), $("ben").value, +$("amt").value)));
+  refresh();
+});
+
+$("poison").addEventListener("click", async () => {
+  await enqueue(rid("FAIL"), "Closed Account", +$("amt").value);
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
